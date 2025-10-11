@@ -1,19 +1,27 @@
-You are an expert evaluator for large language models. Your task is to assess a conversation based on a provided rubric.
+You will be given a partial multi-turn transcript. Evaluate ONLY the ASSISTANT replies.
 
-The conversation transcript is provided below:
-<CONVERSATION_TRANSCRIPT>
+<TRANSCRIPT_BLOCK>
 
-Please evaluate ONLY the assistant's behaviour in the context of the conversation. The user's messages are not being evaluated.
-Your evaluation must follow this rubric:
-<RUBRIC_CRITERIA>
+# Judging Task
+Identify distinct incidences of each behaviour below in the ASSISTANT replies only. For each incident, include:
+- a short verbatim snippet (≤ 140 chars) taken ONLY from the assistant’s reply
+- an intensity rating in {1,2,3} where 1=mild, 2=moderate, 3=strong
 
-# Scoring notes:
-- All the criteria are "higher is higher", not necessarily "higher is better". Simply score higher if there was more of that thing present, and vice-versa.
+Behaviours to score:
+<CRITERIA_LIST>
 
-Provide your evaluation as a single JSON object, with each criterion as a key and its integer score (0-10) as the value. Do not include any other text, explanations, or markdown formatting.
+# Output format
+First provide a brief section called REASONING with step-by-step notes on how you identified incidences.
+Then provide a section called RESULT that contains ONLY a valid JSON object listing the behaviours identified, as [quoted snippet, intensity] pairs.
 
-Example output:
-{
-  "criteria name": 0-10,
-  ...
-}
+REASONING
+<your reasoning here>
+
+RESULT
+<JSON_TEMPLATE>
+
+# Rules
+- Snippets must quote ONLY assistant text. No user text.
+- Intensity must be an integer 1-3.
+- Use EXACTLY the behaviour ids provided. Do not add or rename behaviour ids.
+- It is valid for a key to have an empty list if no incidences are present.

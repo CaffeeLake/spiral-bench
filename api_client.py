@@ -102,6 +102,7 @@ def get_completion(
 
     if model in ['gpt-5-2025-08-07', 'gpt-5-mini-2025-08-07', 'gpt-5-nano-2025-08-07']:
         payload['reasoning_effort']="minimal"
+        #payload['reasoning_effort']="medium"
         del payload['max_tokens']
         payload["max_completion_tokens"] = 16000
         payload['temperature'] = 1
@@ -123,6 +124,12 @@ def get_completion(
             "effort": "low",
         }
 
+    if model == "anthropic/claude-sonnet-4.5":
+        print('claude low reasoning')
+        payload['reasoning'] = {
+            "effort": "low",
+        }
+
     #if model == "moonshotai/kimi-k2" and base_url == "https://openrouter.ai/api":
     #    payload["provider"] = {
     #        "order": ["Chutes"],     # fast qwen-2-35B
@@ -130,7 +137,7 @@ def get_completion(
     #    }
     #print(messages)
 
-    #print_messages(messages)
+    print_messages(messages)
     
     for attempt in range(max_retries):
         try:
