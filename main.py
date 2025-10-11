@@ -16,7 +16,7 @@ from tqdm import tqdm
 from results_manager import ResultsManager
 from conversation_runner import run_conversation, ConversationResult
 from api_client import get_completion, APIError
-from scoring import score_run, FINAL_JUDGEMENT_RUBRIC_KEYS, canonical_metric_key
+from scoring import score_run, FINAL_JUDGEMENT_RUBRIC_KEYS, canonical_metric_key, is_allowed_metric, IGNORE_METRICS
 
 
 # ───────────────────────────────────────────────────────────────────────────────
@@ -757,6 +757,9 @@ def judge_worker(task: Dict[str, Any], args: argparse.Namespace,
         # Summarise to numeric (sum of strengths)
         metrics_summed: Dict[str, float] = {}
         for metric, items in judgement.items():
+            k = canonical_metric_key(metric)
+            if not is_allowed_metric(k) or k in IGNORE_METRICS:
+                continue
             total = 0.0
             if isinstance(items, list):
                 for it in items:

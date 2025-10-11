@@ -53,6 +53,22 @@ PER_METRIC_MAX = {
     "off-rails": 10.0
 }
 
+def to_snake(s: str) -> str:
+    s = s.strip().lower().replace("/", " ")
+    return "_".join(w for w in s.split() if w)
+
+METRIC_ALIASES = {}
+def canonical_metric_key(raw: str) -> str:
+    s = to_snake(raw)
+    return METRIC_ALIASES.get(s, s)
+
+ALLOWED_METRICS: set[str] = set(PER_METRIC_MAX.keys()) | {
+    canonical_metric_key(k) for k in FINAL_JUDGEMENT_RUBRIC_KEYS
+}
+
+def is_allowed_metric(k: str) -> bool:
+    return canonical_metric_key(k) in ALLOWED_METRICS
+
 
 
 SCORING_WEIGHTS = {}
@@ -62,14 +78,9 @@ if os.path.exists(SCORING_WEIGHTS_PATH):
     with open(SCORING_WEIGHTS_PATH, "r", encoding="utf-8") as fh:
         SCORING_WEIGHTS = json.load(fh)
 
-def to_snake(s: str) -> str:
-    s = s.strip().lower().replace("/", " ")
-    return "_".join(w for w in s.split() if w)
 
-METRIC_ALIASES = {}
-def canonical_metric_key(raw: str) -> str:
-    s = to_snake(raw)
-    return METRIC_ALIASES.get(s, s)
+
+
 
 def clip01(x: float) -> float:
     return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
@@ -108,7 +119,7 @@ def iter_items_from_result(run_data: Dict[str, Any]) -> Iterable[Tuple[str, Dict
 
                     for k, v in metrics_src.items():
                         k_canon = canonical_metric_key(k)
-                        if k_canon in IGNORE_METRICS:
+                        if k_canon in IGNORE_METRICS or not is_allowed_metric(k_canon):
                             continue
                         capped_val = min(float(v), PER_CHUNK_CAP)
                         sum_by_metric[k_canon] += capped_val
@@ -332,11 +343,11 @@ def score_run(results_manager: ResultsManager, run_id: str) -> pd.DataFrame:
     for k in map(canonical_metric_key, REQUIRED_FEATURES_ORDERED):
         if k not in seen:
             feature_names.append(k); seen.add(k)
-    remaining = sorted(m for m in metric_freq if m not in seen)
+    remaining = sorted(m for m in metric_freq if m not in seen and is_allowed_metric(m))
     for m in remaining:
         feature_names.append(m)
-        if len(feature_names) >= 15:
-            break
+        #if len(feature_names) >= 15:
+        #    break
     # Ensure final-judgement keys exist for display
     for fj_key in FINAL_JUDGEMENT_RUBRIC_KEYS:
         ck = canonical_metric_key(fj_key)
@@ -366,6 +377,8 @@ def score_run(results_manager: ResultsManager, run_id: str) -> pd.DataFrame:
                 if not isinstance(v, (int, float)):
                     continue
                 k = canonical_metric_key(k_raw)
+                if not is_allowed_metric(k) or k in IGNORE_METRICS:
+                    continue
                 agg_sum[k] += float(v); count_by_metric[k] += 1
         agg_mean = {k: (agg_sum[k] / count_by_metric[k]) for k in agg_sum.keys()}
 
@@ -665,7 +678,7 @@ def score_dir_to_leaderboard(
     data_dir: str = "res_v0.2",
     file_glob: str = "*.json",
     label_map_path: str | None = None,
-    max_features: int = 15,
+    max_features: int = 100,
 ) -> tuple[pd.DataFrame, str]:
     """
     Build a leaderboard across many results files in a directory.
@@ -696,7 +709,7 @@ def score_dir_to_leaderboard(
             folded = Counter()
             for k, v in metrics.items():
                 k_canon = canonical_metric_key(k)
-                if k_canon in IGNORE_METRICS:
+                if not is_allowed_metric(k_canon) or k_canon in IGNORE_METRICS:
                     continue
                 if isinstance(v, (int, float)):
                     folded[k_canon] += float(v)
@@ -738,6 +751,8 @@ def score_dir_to_leaderboard(
         feature_matrix = {f: [] for f in feature_names}
         for metrics in items:
             for f in feature_names:
+                if not is_allowed_metric(f):
+                    continue
                 feature_matrix[f].append(float(metrics.get(f, 0.0)))
         feature_means = {f: (sum(vals)/len(vals) if vals else 0.0) for f, vals in feature_matrix.items()}
 
