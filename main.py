@@ -16,7 +16,8 @@ from tqdm import tqdm
 from results_manager import ResultsManager
 from conversation_runner import run_conversation, ConversationResult
 from api_client import get_completion, APIError
-from scoring import score_run
+from scoring import score_run, FINAL_JUDGEMENT_RUBRIC_KEYS, canonical_metric_key
+
 
 # ───────────────────────────────────────────────────────────────────────────────
 # logging
@@ -143,6 +144,8 @@ def purge_judgements(results_manager: ResultsManager, run_id: str) -> None:
                 convo.pop("judgements", None)
                 # final judgement
                 convo.pop("final_judgement", None)
+                convo.pop("final_judgements", None)
+
 
     # 3) clear run-level summaries (they will be recomputed)
     meta = run_data.get("__meta__")
@@ -335,7 +338,7 @@ def create_judge_task_list(
     return tasks
 
 
-def create_final_judge_task_list(results_manager: ResultsManager, run_id: str) -> list[dict]:
+def create_final_judge_task_list(results_manager: ResultsManager, run_id: str, num_judges: int) -> list[dict]:
     tasks = []
     run_data = results_manager.data.get(run_id, {})
     for file_key, file_results in run_data.items():
@@ -346,19 +349,26 @@ def create_final_judge_task_list(results_manager: ResultsManager, run_id: str) -
         for prompt_key, prompt_results in file_results.items():
             if not isinstance(prompt_results, list):
                 continue
-
             for convo_index, convo_data in enumerate(prompt_results):
                 if not convo_data or not convo_data.get("completed"):
                     continue
-                if "final_judgement" in convo_data:
-                    continue  # resume support
-                tasks.append({
-                    "file_key": file_key,
-                    "prompt_key": prompt_key,
-                    "convo_index": convo_index,
-                    "conversation_data": convo_data,
-                })
+                existing = convo_data.get("final_judgements")
+                if isinstance(existing, list):
+                    have = len(existing)
+                else:
+                    have = 0
+                for jdx in range(num_judges):
+                    need = (not isinstance(existing, list)) or jdx >= have or not isinstance(existing[jdx], dict)
+                    if need:
+                        tasks.append({
+                            "file_key": file_key,
+                            "prompt_key": prompt_key,
+                            "convo_index": convo_index,
+                            "conversation_data": convo_data,
+                            "judge_index": jdx,
+                        })
     return tasks
+
 
 def final_judge_worker(task, args, env_config, results_manager, final_judge_prompt_template: str):
     import copy, re, json
@@ -387,13 +397,18 @@ def final_judge_worker(task, args, env_config, results_manager, final_judge_prom
     ]
 
     try:
-        # Use the first judge for final judging by default
-        first_judge = (env_config.get("JUDGES") or [{}])[0]
+        # Pick judge
+        jdx = int(task.get("judge_index", 0))
+        judges = env_config.get("JUDGES", [])
+        if not judges or jdx < 0 or jdx >= len(judges):
+            return
+        judge_spec = judges[jdx]
+
         resp = get_completion(
-            model=first_judge.get("model", "openai/o3"),
+            model=judge_spec.get("model", "openai/o3"),
             messages=messages,
-            api_key=first_judge.get("api_key", env_config.get("JUDGE_API_KEY")),
-            base_url=first_judge.get("base_url", env_config.get("JUDGE_BASE_URL")),
+            api_key=judge_spec.get("api_key"),
+            base_url=judge_spec.get("base_url"),
             site_url=env_config["SITE_URL"],
             max_retries=env_config["API_MAX_RETRIES"],
             backoff_factor=env_config["API_BACKOFF_FACTOR"],
@@ -403,9 +418,41 @@ def final_judge_worker(task, args, env_config, results_manager, final_judge_prom
         match = re.search(r"\{.*\}", resp, re.DOTALL)
         if not match:
             raise ValueError("Final judge did not return JSON")
-        judgement = json.loads(match.group(0))
+        fj_raw = json.loads(match.group(0))
 
-        conv_data["final_judgement"] = judgement
+        # Canonicalize keys from the judge JSON
+        fj = {}
+        for k, v in fj_raw.items():
+            try:
+                fj[canonical_metric_key(k)] = float(v)
+            except Exception:
+                continue
+
+        # Merge into list-aligned storage
+        existing = conv_data.get("final_judgements")
+        num_judges = len(judges) or 1
+        if not isinstance(existing, list):
+            existing = [None] * num_judges
+        if len(existing) < num_judges:
+            existing = existing + [None] * (num_judges - len(existing))
+        existing[jdx] = fj
+        conv_data["final_judgements"] = existing
+
+        # Refresh averaged single dict using rubric keys
+        fj_keys = [canonical_metric_key(k) for k in FINAL_JUDGEMENT_RUBRIC_KEYS]
+        vals = {k: [] for k in fj_keys}
+        for item in existing:
+            if isinstance(item, dict):
+                for k in fj_keys:
+                    if k in item:
+                        try:
+                            vals[k].append(float(item[k]))
+                        except Exception:
+                            pass
+        averaged = {k: (sum(vals[k]) / len(vals[k]) if vals[k] else 0.0) for k in fj_keys}
+        conv_data["final_judgement"] = averaged
+
+
         results_manager.save_result(
             run_id=args.run_id,
             file_key=task["file_key"],
@@ -413,6 +460,7 @@ def final_judge_worker(task, args, env_config, results_manager, final_judge_prom
             convo_index=task["convo_index"],
             conversation_data=conv_data,
         )
+
 
     except (APIError, ValueError, json.JSONDecodeError) as e:
         logging.error(f"Final judging error for {task['file_key']}/{task['prompt_key']} convo{task['convo_index']}: {e}")
@@ -1026,7 +1074,7 @@ def main():
     # ── final judging phase ────────────────────────────────────────────────
     logging.info("--- Final Judging Phase ---")
     final_judge_prompt_template = load_text_file("prompts/final_judge_prompt.txt")
-    final_tasks = create_final_judge_task_list(results_manager, args.run_id)
+    final_tasks = create_final_judge_task_list(results_manager, args.run_id, num_judges=len(env_config["JUDGES"]))
     if not final_tasks:
         logging.info("No conversations require final judging.")
     else:
