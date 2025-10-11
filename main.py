@@ -115,18 +115,18 @@ def extract_expected_metrics(criteria_text: str) -> set[str]:
 # ───────────────────────────────────────────────────────────────────────────────
 def purge_judgements(results_manager: ResultsManager, run_id: str) -> None:
     """
-    Removes all stored judge results for a run_id, both legacy single‑block
-    and new per‑chunk data.
+    Removes all stored judge results for a run_id, both legacy single-block,
+    new per-chunk data, and final judgements.
     """
     run_data = results_manager.data.get(run_id, {})
     if not run_data:
         return
 
-    # 1. delete any synthetic per‑chunk keys that may exist
+    # 1) delete any synthetic per-chunk keys that may exist
     for k in [k for k in list(run_data) if "::chunk" in k]:
         del run_data[k]
 
-    # 2. strip judgement fields from each conversation
+    # 2) strip judgement fields from each conversation
     for file_key, file_results in run_data.items():
         if file_key in ("__meta__", "scoring_summary", "final_judgement_summary"):
             continue
@@ -136,13 +136,41 @@ def purge_judgements(results_manager: ResultsManager, run_id: str) -> None:
             if not isinstance(prompt_results, list):
                 continue
             for convo in prompt_results:
+                if not convo:
+                    continue
+                # legacy single and new multi
+                convo.pop("judgement", None)
+                convo.pop("judgements", None)
+                # final judgement
+                convo.pop("final_judgement", None)
 
-                if convo:
-                    convo.pop("judgement", None)
-                    convo.pop("judgements", None)
+    # 3) clear run-level summaries (they will be recomputed)
+    meta = run_data.get("__meta__")
+    if isinstance(meta, dict):
+        meta.pop("final_judgement_summary", None)
+        meta.pop("scoring_summary", None)
 
-    # persist to disk atomically
     results_manager._atomic_write()
+
+def _load_judges_from_env(models_csv: str) -> list[dict]:
+    """
+    Build an ordered list of judge specs aligned to --judge-models.
+    Each spec: {"model": str, "base_url": str, "api_key": str}
+    Looks up JUDGE{idx}_BASE_URL / JUDGE{idx}_API_KEY with fallback
+    to JUDGE_BASE_URL / JUDGE_API_KEY.
+    """
+    models = [m.strip() for m in (models_csv or "").split(",") if m.strip()]
+    if not models:
+        raise ValueError("At least one judge model must be provided via --judge-models.")
+    judges = []
+    for idx, model in enumerate(models, start=1):
+        base_url = os.getenv(f"JUDGE{idx}_BASE_URL", os.getenv("JUDGE_BASE_URL", "https://openrouter.ai/api"))
+        api_key  = os.getenv(f"JUDGE{idx}_API_KEY",  os.getenv("JUDGE_API_KEY"))
+        if not api_key:
+            raise ValueError(f"Missing API key for judge {idx} ({model}). "
+                             f"Set JUDGE{idx}_API_KEY or JUDGE_API_KEY.")
+        judges.append({"model": model, "base_url": base_url, "api_key": api_key})
+    return judges
 
 
 
@@ -248,6 +276,7 @@ def create_judge_task_list(
     run_id: str,
     expected_metrics: Set[str],
     chunk_size: int,
+    num_judges: int,
 ) -> List[Dict[str, Any]]:
     """
     Builds judging tasks *per chunk* while preventing recursive expansion.
@@ -260,43 +289,51 @@ def create_judge_task_list(
     for file_key, file_results in run_data.items():
         if "::chunk" in file_key:
             continue
-        # skip meta buckets and anything that isn't a file→prompt map
         if file_key in ("__meta__", "scoring_summary", "final_judgement_summary"):
             continue
         if not isinstance(file_results, dict):
             continue
 
         for prompt_key, prompt_results in file_results.items():
-            # only accept real convo lists
             if not isinstance(prompt_results, list):
                 continue
 
             for convo_index, convo_data in enumerate(prompt_results):
-
                 if not convo_data or not convo_data.get("completed"):
                     continue
 
-                transcript = convo_data["transcript"]
+                transcript = convo_data.get("transcript", [])
                 chunks = make_chunks(transcript, chunk_size)
                 if not chunks:
                     continue
 
-                for chunk_idx, chunk_pairs in enumerate(chunks):
-                    existing = (convo_data.get("judgements") or {})
-                    if f"chunk{chunk_idx}" in existing:
-                        continue
+                # Existing judgements may be legacy dict or new list-of-dicts
+                existing = convo_data.get("judgements")
+                if isinstance(existing, dict):
+                    existing_list = [existing] + [{} for _ in range(max(0, num_judges - 1))]
+                elif isinstance(existing, list):
+                    existing_list = list(existing) + [{} for _ in range(max(0, num_judges - len(existing)))]
+                else:
+                    existing_list = [{} for _ in range(num_judges)]
 
-                    tasks.append({
-                        "file_key": file_key,
-                        "prompt_key": prompt_key,
-                        "convo_index": convo_index,
-                        "chunk_index": chunk_idx,
-                        "initial_user": transcript[0]["content"],
-                        "chunk_pairs": chunk_pairs,
-                        "expected_metrics": expected_metrics,
-                        "conversation_data": convo_data,
-                    })
+                for jdx in range(num_judges):
+                    by_chunk = existing_list[jdx] if isinstance(existing_list[jdx], dict) else {}
+                    for chunk_idx, chunk_pairs in enumerate(chunks):
+                        if f"chunk{chunk_idx}" in by_chunk:
+                            continue
+                        tasks.append({
+                            "file_key": file_key,
+                            "prompt_key": prompt_key,
+                            "convo_index": convo_index,
+                            "chunk_index": chunk_idx,
+                            "initial_user": transcript[0]["content"] if transcript else "",
+                            "chunk_pairs": chunk_pairs,
+                            "expected_metrics": expected_metrics,
+                            "conversation_data": convo_data,
+                            "judge_index": jdx,  # new
+                        })
     return tasks
+
 
 def create_final_judge_task_list(results_manager: ResultsManager, run_id: str) -> list[dict]:
     tasks = []
@@ -350,16 +387,19 @@ def final_judge_worker(task, args, env_config, results_manager, final_judge_prom
     ]
 
     try:
+        # Use the first judge for final judging by default
+        first_judge = (env_config.get("JUDGES") or [{}])[0]
         resp = get_completion(
-            model=args.judge_model,
+            model=first_judge.get("model", "openai/o3"),
             messages=messages,
-            api_key=env_config["JUDGE_API_KEY"],
-            base_url=env_config["JUDGE_BASE_URL"],
+            api_key=first_judge.get("api_key", env_config.get("JUDGE_API_KEY")),
+            base_url=first_judge.get("base_url", env_config.get("JUDGE_BASE_URL")),
             site_url=env_config["SITE_URL"],
             max_retries=env_config["API_MAX_RETRIES"],
             backoff_factor=env_config["API_BACKOFF_FACTOR"],
             max_tokens=2048,
         )
+
         match = re.search(r"\{.*\}", resp, re.DOTALL)
         if not match:
             raise ValueError("Final judge did not return JSON")
@@ -515,13 +555,21 @@ def judge_worker(task: Dict[str, Any], args: argparse.Namespace,
     """
     import copy
 
+    # pick judge spec
+    jdx = int(task.get("judge_index", 0))
+    judges = env_config.get("JUDGES", [])
+    if not judges or jdx < 0 or jdx >= len(judges):
+        return  # defensive: nothing to do
+    judge_spec = judges[jdx]
+    judge_model = judge_spec["model"]
+
+
     # Lock specific to this (run_id, file_key, prompt_key, convo_index)
     conv_lock = get_convo_lock(args.run_id, task["file_key"], task["prompt_key"], task["convo_index"])
 
     def _write_error_stub(errmsg: str):
         # Write a minimal error stub for this chunk under the conversation lock.
         with conv_lock:
-            # fetch the freshest copy
             current_convo = (
                 results_manager.data.get(args.run_id, {})
                 .get(task["file_key"], {})
@@ -536,11 +584,19 @@ def judge_worker(task: Dict[str, Any], args: argparse.Namespace,
             else:
                 updated_convo = copy.deepcopy(task["conversation_data"])
 
-            judgements_map = updated_convo.get("judgements")
-            if not isinstance(judgements_map, dict):
-                judgements_map = {}
-            judgements_map[f"chunk{task['chunk_index']}"] = {"error": str(errmsg)}
-            updated_convo["judgements"] = judgements_map
+            existing = updated_convo.get("judgements")
+            num_judges = len(env_config.get("JUDGES", [])) or 1
+            if isinstance(existing, dict):
+                lst = [existing] + [{} for _ in range(max(0, num_judges - 1))]
+            elif isinstance(existing, list):
+                lst = list(existing) + [{} for _ in range(max(0, num_judges - len(existing)))]
+            else:
+                lst = [{} for _ in range(num_judges)]
+
+            by_chunk = lst[jdx] if isinstance(lst[jdx], dict) else {}
+            by_chunk[f"chunk{task['chunk_index']}"] = {"error": str(errmsg)}
+            lst[jdx] = by_chunk
+            updated_convo["judgements"] = lst
 
             results_manager.save_result(
                 run_id=args.run_id,
@@ -549,6 +605,7 @@ def judge_worker(task: Dict[str, Any], args: argparse.Namespace,
                 convo_index=task["convo_index"],
                 conversation_data=updated_convo,
             )
+
 
     try:
         # ── build formatted transcript snippet ───────────────────────────────
@@ -605,10 +662,10 @@ def judge_worker(task: Dict[str, Any], args: argparse.Namespace,
 
         # Do the call (api_client has its own retry loop)
         judgement_str = get_completion(
-            model=args.judge_model,
+            model=judge_model,
             messages=messages,
-            api_key=env_config["JUDGE_API_KEY"],
-            base_url=env_config["JUDGE_BASE_URL"],
+            api_key=judge_spec["api_key"],
+            base_url=judge_spec["base_url"],
             site_url=env_config["SITE_URL"],
             max_retries=env_config["API_MAX_RETRIES"],
             backoff_factor=env_config["API_BACKOFF_FACTOR"],
@@ -685,18 +742,26 @@ def judge_worker(task: Dict[str, Any], args: argparse.Namespace,
             else:
                 updated_convo = copy.deepcopy(task["conversation_data"])
 
+            num_judges = len(env_config.get("JUDGES", [])) or 1
             existing = updated_convo.get("judgements")
-            if not isinstance(existing, dict):
-                existing = {}
+            if isinstance(existing, dict):
+                lst = [existing] + [{} for _ in range(max(0, num_judges - 1))]
+            elif isinstance(existing, list):
+                lst = list(existing) + [{} for _ in range(max(0, num_judges - len(existing)))]
+            else:
+                lst = [{} for _ in range(num_judges)]
 
-            existing[f"chunk{task['chunk_index']}"] = {
+            by_chunk = lst[jdx] if isinstance(lst[jdx], dict) else {}
+
+            by_chunk[f"chunk{task['chunk_index']}"] = {
                 "metrics": metrics_summed,
                 "full_metrics": judgement,
                 "raw_text": judgement_str,
                 "assistant_turn_indexes": assistant_turn_indexes,
                 "assistant_length_chars": int(assistant_chars_assessed),
             }
-            updated_convo["judgements"] = existing
+            lst[jdx] = by_chunk
+            updated_convo["judgements"] = lst
 
             results_manager.save_result(
                 run_id=args.run_id,
@@ -705,6 +770,7 @@ def judge_worker(task: Dict[str, Any], args: argparse.Namespace,
                 convo_index=task["convo_index"],
                 conversation_data=updated_convo,
             )
+
 
     except (APIError, json.JSONDecodeError, ValueError) as e:
         logging.error(
@@ -741,7 +807,9 @@ def main():
 
     # judging
     parser.add_argument("--skip-judging", action="store_true")
-    parser.add_argument("--judge-model", default="openai/o3")
+    parser.add_argument("--judge-models", type=str, default="gpt-5-2025-08-07",
+                    help="Comma-separated list of judge models. Duplicates allowed.")
+
     parser.add_argument("--rubric-criteria-file", default="data/rubric_criteria.txt")
     parser.add_argument("--rubric-prompt-file", default="data/rubric_prompt.txt")
     parser.add_argument("--judge-assistant-max-chars", type=int, default=20000,
@@ -764,20 +832,23 @@ def main():
     load_dotenv()  # .env
 
     fallback_key = os.getenv("OPENROUTER_API_KEY")
+
     env_config = {
         "USER_AGENT_API_KEY": os.getenv("USER_AGENT_API_KEY", fallback_key),
         "EVALUATED_MODEL_API_KEY": os.getenv("EVALUATED_MODEL_API_KEY", fallback_key),
-        "JUDGE_API_KEY": os.getenv("JUDGE_API_KEY", fallback_key),
+        # Note: per-judge creds are loaded below, do not keep single JUDGE_* here.
         "SITE_URL": os.getenv("OPENROUTER_SITE_URL", "http://localhost"),
         "USER_AGENT_BASE_URL": os.getenv("USER_AGENT_BASE_URL", "https://openrouter.ai/api"),
         "EVALUATED_MODEL_BASE_URL": os.getenv("EVALUATED_MODEL_BASE_URL", "https://openrouter.ai/api"),
-        "JUDGE_BASE_URL": os.getenv("JUDGE_BASE_URL", "https://openrouter.ai/api"),
         "API_MAX_RETRIES": int(os.getenv("API_MAX_RETRIES", 7)),
         "API_BACKOFF_FACTOR": float(os.getenv("API_BACKOFF_FACTOR", 2.0)),
     }
-    for k in ("USER_AGENT_API_KEY", "EVALUATED_MODEL_API_KEY", "JUDGE_API_KEY"):
+
+    # Validate agent keys only; judge keys are validated per-judge in _load_judges_from_env.
+    for k in ("USER_AGENT_API_KEY", "EVALUATED_MODEL_API_KEY"):
         if not env_config[k]:
             raise ValueError(f"Missing API key {k}. Add to .env or export.")
+
 
     if not args.run_id:
         args.run_id = f"run_{uuid.uuid4().hex[:8]}"
@@ -799,6 +870,13 @@ def main():
             results_manager._atomic_write()
 
     _migrate_run_meta(results_manager, args.run_id)
+
+    # load judges and persist their descriptors (no secrets) into run meta
+    env_config["JUDGES"] = _load_judges_from_env(args.judge_models)
+    run_meta = results_manager.data.setdefault(args.run_id, {}).setdefault("__meta__", {})
+    run_meta["judges"] = [{"model": j["model"], "base_url": j["base_url"]} for j in env_config["JUDGES"]]
+    results_manager._atomic_write()
+
 
 
     # ── generation phase ─────────────────────────────────────────────────────
@@ -848,12 +926,15 @@ def main():
     expected_metrics = extract_expected_metrics(rubric_criteria_text)
 
     judge_tasks = create_judge_task_list(results_manager, args.run_id,
-                                         expected_metrics, args.judge_chunk_size)
+                                     expected_metrics, args.judge_chunk_size,
+                                     num_judges=len(env_config["JUDGES"]))
+
 
     if not judge_tasks:
         logging.info("No unjudged conversations found.")
 
-    logging.info(f"{len(judge_tasks)} conversations to judge.")
+    logging.info(f"{len(judge_tasks)} judge-chunk tasks to run.")
+
     with ThreadPoolExecutor(max_workers=args.parallelism) as ex:
         futs = [ex.submit(judge_worker, t, args, env_config,
                           results_manager, rubric_prompt_template,
@@ -878,10 +959,27 @@ def main():
             if not isinstance(p_results, list):
                 continue
             for convo in p_results:
-
                 if not convo:
                     continue
-                for chunk in (convo.get("judgements") or {}).values():
+
+                judg = convo.get("judgements")
+
+                # Iterate chunks for: list-of-dicts (multi-judge) OR dict (legacy)
+                if isinstance(judg, list):
+                    chunk_iters = []
+                    for jmap in judg:
+                        if isinstance(jmap, dict):
+                            chunk_iters.append(jmap.values())
+                    # flatten
+                    chunks_iter = (chunk for it in chunk_iters for chunk in it)
+                elif isinstance(judg, dict):
+                    chunks_iter = judg.values()
+                else:
+                    continue
+
+                for chunk in chunks_iter:
+                    if not isinstance(chunk, dict):
+                        continue
                     # Prefer full_metrics if present
                     fm = chunk.get("full_metrics")
                     if isinstance(fm, dict):
@@ -923,6 +1021,7 @@ def main():
                             instances_sum[metric] += c
                             strength_sum[metric]  += c  # assume avg strength=1 in legacy
                             chunks_with_metric[metric] += 1
+
 
     # ── final judging phase ────────────────────────────────────────────────
     logging.info("--- Final Judging Phase ---")

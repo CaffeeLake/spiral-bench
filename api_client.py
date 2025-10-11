@@ -137,7 +137,7 @@ def get_completion(
     #    }
     #print(messages)
 
-    print_messages(messages)
+    #print_messages(messages)
     
     for attempt in range(max_retries):
         try:
