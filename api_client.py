@@ -66,78 +66,121 @@ def get_completion(
     """
     if not api_key:
         raise APIError(f"API key is missing for model {model}.")
+    
+    # Detect if this is Anthropic API
+    is_anthropic = "anthropic.com" in base_url
+    
+    if is_anthropic:
+        # Anthropic API path
+        api_url = base_url
+        headers = {
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json"
+        }
         
-    api_url = f"{base_url.rstrip('/')}/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "HTTP-Referer": site_url,
-        "X-Title": "Automated Red Teaming Pipeline",
-    }
-    payload = {
-        "model": model,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": 0.3,
-    }
+        # Convert messages to Anthropic format
+        anthropic_messages = []
+        system_message = None
+        
+        for msg in messages:
+            if msg["role"] == "system":
+                system_message = msg["content"]
+            else:
+                anthropic_messages.append({
+                    "role": msg["role"],
+                    "content": msg["content"]
+                })
+        
+        payload = {
+            "model": model,
+            "messages": anthropic_messages,
+            "max_tokens": max_tokens,
+        }
+        
+        if system_message:
+            payload["system"] = system_message
+        
+        if model == "claude-sonnet-4-5-20250929":
+            print('claude judge no thinking')
+            payload['thinking'] = {
+                "type": "disabled"
+            }
+    else:
+        # OpenAI-compatible path
+        api_url = base_url #f"{base_url.rstrip('/')}/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "HTTP-Referer": site_url,
+            "X-Title": ".",
+        }
+        payload = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0.3,
+        }
 
-    if base_url == 'https://api.openai.com/v1/chat/completions':
+        if api_url == 'https://api.openai.com/v1/chat/completions':
+            if 'min_p' in payload:
                 del payload['min_p']
 
-    if model in ['openai/gpt-oss-120b', 'openai/gpt-oss-20b']:
-        payload['provider'] =  {
-            "order": [
-                "DeepInfra"
-            ],
-            "allow_fallbacks": False
-        }
-        payload['reasoning'] = {
-            "effort": "low",
-        }
-    if model == "openai/gpt-oss-120b":
-        payload['max_tokens'] = 8096 # let it cook
-    if model == "o3":
-        del payload["max_tokens"]
-        del payload["temperature"]
-        payload["max_completion_tokens"] = 16000
+        if model in ['openai/gpt-oss-120b', 'openai/gpt-oss-20b']:
+            payload['provider'] =  {
+                "order": [
+                    "DeepInfra"
+                ],
+                "allow_fallbacks": False
+            }
+            payload['reasoning'] = {
+                "effort": "low",
+            }
+        if model == "openai/gpt-oss-120b":
+            payload['max_tokens'] = 8096 # let it cook
+        if model == "o3":
+            del payload["max_tokens"]
+            del payload["temperature"]
+            payload["max_completion_tokens"] = 16000
 
-    if model in ['gpt-5-2025-08-07', 'gpt-5-mini-2025-08-07', 'gpt-5-nano-2025-08-07']:
-        payload['reasoning_effort']="minimal"
-        #payload['reasoning_effort']="medium"
-        del payload['max_tokens']
-        payload["max_completion_tokens"] = 16000
-        payload['temperature'] = 1
+        if model in ['gpt-5-2025-08-07', 'gpt-5-mini-2025-08-07', 'gpt-5-nano-2025-08-07']:
+            payload['reasoning_effort']="minimal"
+            #payload['reasoning_effort']="medium"
+            del payload['max_tokens']
+            payload["max_completion_tokens"] = 16000
+            payload['temperature'] = 1
 
-    if model in ['gpt-5-chat-latest']:
-        del payload['max_tokens']
-        payload["max_completion_tokens"] = 16000
-        payload['temperature'] = 1
-    
-    if model == "deepseek/deepseek-r1-0528":
-        payload['max_tokens'] = 32000
+        if model in ['gpt-5-chat-latest']:
+            del payload['max_tokens']
+            payload["max_completion_tokens"] = 16000
+            payload['temperature'] = 1
+        
+        if model == "deepseek/deepseek-r1-0528":
+            payload['max_tokens'] = 32000
 
-    if model == "google/gemini-2.5-pro":
-        payload['reasoning'] = {
-            "max_tokens": 1,
-        }
-    if model == "openai/o4-mini":
-        payload['reasoning'] = {
-            "effort": "low",
-        }
+        if model == "google/gemini-2.5-pro":
+            payload['reasoning'] = {
+                "max_tokens": 1,
+            }
+        if model == "openai/o4-mini":
+            payload['reasoning'] = {
+                "effort": "low",
+            }
 
-    if model == "anthropic/claude-sonnet-4.5":
-        print('claude low reasoning')
-        payload['reasoning'] = {
-            "effort": "low",
-        }
+        if model == "anthropic/claude-sonnet-4.5":
+            print('claude low reasoning')
+            payload['reasoning'] = {
+                "effort": "low",
+            }
+        
 
-    #if model == "moonshotai/kimi-k2" and base_url == "https://openrouter.ai/api":
-    #    payload["provider"] = {
-    #        "order": ["Chutes"],     # fast qwen-2-35B
-    #        "allow_fallbacks": False,
-    #    }
-    #print(messages)
+        #if model == "moonshotai/kimi-k2" and api_url == "https://openrouter.ai/api":
+        #    payload["provider"] = {
+        #        "order": ["Chutes"],     # fast qwen-2-35B
+        #        "allow_fallbacks": False,
+        #    }
+        #print(messages)
 
-    #print_messages(messages)
+        #print_messages(messages)
     
     for attempt in range(max_retries):
         try:
@@ -167,28 +210,46 @@ def get_completion(
             if "error" in data:
                 raise APIError(f"API error: {data['error']}")
             
-            choices = data.get("choices", [])
-            if not choices:
-                raise APIError("No choices in API response")
-            
-            first_choice = choices[0]
-            message = first_choice.get("message", {})
-            content = message.get("content", "")
+            if is_anthropic:
+                # Parse Anthropic response format
+                content_blocks = data.get("content", [])
+                if not content_blocks:
+                    raise APIError("No content in Anthropic API response")
+                
+                # Extract text from content blocks
+                content = ""
+                for block in content_blocks:
+                    if block.get("type") == "text":
+                        content += block.get("text", "")
+                
+                if content and content.strip():
+                    return content
+                
+                raise APIError("Received empty content from Anthropic")
+            else:
+                # Parse OpenAI-style response format
+                choices = data.get("choices", [])
+                if not choices:
+                    raise APIError("No choices in API response")
+                
+                first_choice = choices[0]
+                message = first_choice.get("message", {})
+                content = message.get("content", "")
 
-            if '<|reserved_token_163839|>' in content:
-                # this is a kimi-k2 issue that occurs sometimes. retry.
-                raise APIError("Garbage tokens in output")
-            
-            finish_reason = first_choice.get("finish_reason")
-            #if finish_reason == "content_filter":
-            #    raise APIError(f"Content filtered by {model}")
-            if finish_reason == "length":
-                logging.warning(f"Response truncated due to length limit for {model}")
-            
-            if content and content.strip():
-                return content
-            
-            raise APIError("Received empty content")
+                if '<|reserved_token_163839|>' in content:
+                    # this is a kimi-k2 issue that occurs sometimes. retry.
+                    raise APIError("Garbage tokens in output")
+                
+                finish_reason = first_choice.get("finish_reason")
+                #if finish_reason == "content_filter":
+                #    raise APIError(f"Content filtered by {model}")
+                if finish_reason == "length":
+                    logging.warning(f"Response truncated due to length limit for {model}")
+                
+                if content and content.strip():
+                    return content
+                
+                raise APIError("Received empty content")
             
         except requests.exceptions.RequestException as req_err:
             logging.warning(f"[{model}] attempt {attempt+1}/{max_retries} failed: {req_err}")

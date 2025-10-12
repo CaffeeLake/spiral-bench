@@ -699,7 +699,7 @@ def judge_worker(task: Dict[str, Any], args: argparse.Namespace,
         filled_prompt = (
             rubric_prompt_template
                 .replace("<TRANSCRIPT_BLOCK>", transcript_block)
-                .replace("<CRITERIA_LIST>", criteria_list)
+                .replace("<CRITERIA_LIST>", rubric_criteria)
                 .replace("<JSON_TEMPLATE>", json_template)
         )
 

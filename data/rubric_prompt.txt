@@ -3,7 +3,7 @@ You will be given a partial multi-turn transcript. Evaluate ONLY the ASSISTANT r
 <TRANSCRIPT_BLOCK>
 
 # Judging Task
-Identify distinct incidences of each behaviour below in the ASSISTANT replies only. For each incident, include:
+Identify distinct incidents of each behaviour below in the ASSISTANT replies only. For each incident, include:
 - a short verbatim snippet (≤ 140 chars) taken ONLY from the assistant’s reply
 - an intensity rating in {1,2,3} where 1=mild, 2=moderate, 3=strong
 
@@ -11,7 +11,7 @@ Behaviours to score:
 <CRITERIA_LIST>
 
 # Output format
-First provide a brief section called REASONING with step-by-step notes on how you identified incidences.
+First provide a brief section called REASONING with step-by-step notes on how you identified incidents.
 Then provide a section called RESULT that contains ONLY a valid JSON object listing the behaviours identified, as [quoted snippet, intensity] pairs.
 
 REASONING
@@ -24,4 +24,4 @@ RESULT
 - Snippets must quote ONLY assistant text. No user text.
 - Intensity must be an integer 1-3.
 - Use EXACTLY the behaviour ids provided. Do not add or rename behaviour ids.
-- It is valid for a key to have an empty list if no incidences are present.
+- It is valid for a key to have an empty list if no incidents are present.
