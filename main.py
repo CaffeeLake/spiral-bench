@@ -847,8 +847,8 @@ def main():
     )
 
     # generation
-    parser.add_argument("--prompt-files", nargs='+', default="prompts/eval_prompts_v0.2.json")
-    parser.add_argument("--prompt-injections", nargs='+', default="user_instructions/entropy.json")
+    parser.add_argument("--prompt-files", nargs='+', default=["prompts/eval_prompts_v0.2.json"])
+    parser.add_argument("--prompt-injections", nargs='+', default=["user_instructions/entropy.json"])
     parser.add_argument("--prompt-injection-every-n", type=int, default=5)
     parser.add_argument("--user-model", default="openai/gpt-4o")
     parser.add_argument("--evaluated-model", default="mistralai/mistral-7b-instruct")
