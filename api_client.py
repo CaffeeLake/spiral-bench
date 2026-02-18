@@ -101,11 +101,10 @@ def get_completion(
         if system_message:
             payload["system"] = system_message
         
-        if model == "claude-sonnet-4-5-20250929":
-            print('claude judge no thinking')
-            payload['thinking'] = {
-                "type": "disabled"
-            }
+        # disable reasoning for all anthropic models
+        payload['thinking'] = {
+            "type": "disabled"
+        }
     else:
         # OpenAI-compatible path
         api_url = base_url #f"{base_url.rstrip('/')}/chat/completions"
@@ -171,7 +170,18 @@ def get_completion(
             payload['reasoning'] = {
                 "effort": "low",
             }
+
+        if model == "openai/gpt-5.2":
+            print('gpt-5.2 none reasoning')
+            payload['reasoning'] = {
+                "effort": "none",
+            }
         
+        if api_url.startswith("https://openrouter.ai/api"):
+            # disable reasoning for all openrouter models
+            payload['reasoning'] = {
+                "enabled": False,
+            }
 
         #if model == "moonshotai/kimi-k2" and api_url == "https://openrouter.ai/api":
         #    payload["provider"] = {
